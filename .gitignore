@@ -1,0 +1,16 @@
+# Local dependencies, settings and recordings never belong in a release.
+.venv/
+.runtime/
+.downloads/
+.local/
+outputs/
+dist/
+__pycache__/
+*.pyc
+*.log
+*.mp4
+*.ply
+*.sog
+*.spz
+*.resume
+*.lnk

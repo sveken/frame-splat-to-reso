@@ -1,0 +1,27 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frame Splat to Resonite — Quick guide</title>
+<style>body{margin:0;background:#111822;color:#edf3fa;font:17px/1.6 system-ui,sans-serif}main{max-width:820px;margin:auto;padding:40px 24px}h1{font-size:34px;line-height:1.2}h2{margin-top:30px;font-size:23px}p,li{color:#bdcadb}strong{color:#edf3fa}a{color:#6fe3c3}code{background:#243346;padding:2px 5px;border-radius:4px}li{margin-bottom:7px}.tip{background:#1b2634;border-left:4px solid #6fe3c3;padding:16px 20px}table{border-collapse:collapse;width:100%;font-size:15px}th,td{text-align:left;padding:9px;border-bottom:1px solid #34465c}</style>
+<main><h1>Record. Convert. Crop. Import.</h1>
+<p>Frame Splat uses Arcturus stereo images, COLMAP reconstruction and LichtFeld training to create a Gaussian PLY. Everything runs on your PC.</p>
+<h2>Convert a recording</h2><ol>
+<li>Sync the original MP4 with Arcturus Vision Sync.</li>
+<li>Open <strong>Start.cmd</strong>. Choose the recording, output folder and <strong>LichtFeld-Studio.exe</strong>.</li>
+<li>Choose <strong>Preview</strong> for a first test, then click <strong>Convert</strong>.</li>
+<li>Wait for completion. Results go into a new dated folder.</li></ol>
+<h2>Crop before import</h2>
+<div class="tip"><strong>Huge crop box? Use Fit to Scene (Trimmed).</strong><br>Stray splats can sit far from your subject. The trimmed fit ignores extreme outliers when sizing the box.</div>
+<ol><li>Click <strong>Inspect / crop in LichtFeld</strong>. Turn <strong>Point Cloud Mode</strong> off.</li>
+<li>In the Scene panel, right-click the model → <strong>Add Crop Box</strong>.</li>
+<li>Right-click the crop box → <strong>Fit to Scene (Trimmed)</strong>.</li>
+<li>Adjust <strong>Position</strong> and <strong>Size</strong>. You can type values directly. Check several sides and leave a small margin.</li>
+<li>Right-click the box → <strong>Apply</strong>.</li>
+<li><strong>File → Export → PLY</strong>. Save a new filename and keep the original.</li></ol>
+<p>Cropping does not require retraining. Controls above match the tested LichtFeld build 5a92bff; newer builds may use different labels.</p>
+<h2>Import into Resonite</h2><p>Import the cropped PLY and choose <strong>Gaussian Splat</strong>. Leave SPZ compression off for the first check. Once it looks correct, compare a compressed copy. Inspect from several angles in VR.</p>
+<p>For editing inside Resonite, use <strong>Resonite Essentials → Tools and Misc → Gaussian Splat Tool</strong>. Select Clip Box, draw the region with primary, then press secondary to create a cropped copy.</p>
+<h2>Choose quality</h2><table><tr><th>Preset</th><th>Images</th><th>Steps</th><th>Maximum splats</th></tr><tr><td>Preview</td><td>100 stereo pairs, half size</td><td>7,000</td><td>500,000</td></tr><tr><td>Detailed</td><td>150 stereo pairs, full size</td><td>30,000</td><td>1.5 million</td></tr><tr><td>Room</td><td>300 stereo pairs, full size</td><td>30,000</td><td>1.5 million</td></tr></table>
+<p>More views improve coverage. Resolution preserves image detail. Steps refine the model. The splat limit controls maximum size. A 1.5-million-splat PLY is about 372 MB before cropping or compression.</p>
+<h2>Capture well</h2><ul><li>Walk slowly around a stationary subject. Keep views sharp and overlapping.</li><li>Make passes at different heights. Capture every surface you want to see later.</li><li>Glass, reflections and moving objects can leave smears or floating splats.</li><li>For a house, record rooms or connected sections. This app does not merge recordings.</li></ul>
+<h2>If a run stops</h2><p>Open the run folder and read <code>conversion.log</code>. Existing files stay in place. If reconstruction finished, <strong>Reuse prepared scan</strong> starts new training from those images and camera positions. It keeps the old frame selection and does not resume the optimizer.</p>
+<p>CPU-heavy reconstruction is normal. Training uses the NVIDIA GPU. If memory runs out, close GPU-heavy apps and try Preview. Keep at least 12 GB free; larger recordings need more.</p>
+<p><a href="README.md">Setup and sharing</a> · <a href="https://arcturus.vision/apps#create-gaussian-model">Arcturus</a> · <a href="https://github.com/MrNeRF/LichtFeld-Studio/blob/5a92bff/src/visualizer/gui/panels/scene_panel.cpp">LichtFeld crop controls</a> · <a href="https://wiki.resonite.com/Gaussian_Splat_Tool">Resonite crop tool</a></p></main></html>
