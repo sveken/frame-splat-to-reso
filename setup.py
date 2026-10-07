@@ -20,6 +20,9 @@ DOWNLOADS = {
     'colmap.zip': (
         'https://github.com/colmap/colmap/releases/download/3.12.6/colmap-x64-windows-cuda.zip',
         'bf9e01ba942df89d3dc561626e5a89300b0b09371afcdc33e17a60e9511cf081'),
+    'openmvs-2.4.0.zip': (
+        'https://github.com/cdcseacave/openMVS/releases/download/v2.4.0/OpenMVS_Windows_x64.zip',
+        '0c31660c15c9ebc4c106873cf67564d9570d404aef7a6403451da1b6178b2167'),
 }
 PATCHES = {
     'pycolmap.Database.open(database_path)': 'pycolmap.Database(str(database_path))',
@@ -98,12 +101,27 @@ def prepare_tools(cache):
     safe_extract(colmap, RUNTIME / 'colmap')
     if not (RUNTIME / 'colmap/bin/colmap.exe').is_file():
         raise RuntimeError('COLMAP archive did not contain the expected Windows executable.')
+    prepare_mesh_tools(cache)
+
+
+def prepare_mesh_tools(cache):
+    archive = download('openmvs-2.4.0.zip', cache)
+    safe_extract(archive, RUNTIME / 'openmvs')
+    from config import OPENMVS
+    for name in ('InterfaceCOLMAP', 'ReconstructMesh', 'TextureMesh'):
+        if not (OPENMVS / f'{name}.exe').is_file():
+            raise RuntimeError(f'OpenMVS archive is missing {name}.exe.')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cache', type=Path, default=ROOT / '.downloads')
+    parser.add_argument('--mesh-only', action='store_true', help='Add mesh tools to an existing installation')
     args = parser.parse_args()
+    if args.mesh_only:
+        prepare_mesh_tools(args.cache.resolve())
+        print('Mesh tools installed. Reopen Start.cmd.')
+        return
     if os.name != 'nt' or struct.calcsize('P') != 8 or sys.version_info[:2] != (3, 12):
         raise RuntimeError('Setup needs 64-bit Python 3.12 on Windows. See README.md.')
     import tkinter  # Fail early if Python was installed without Tcl/Tk.

@@ -11,6 +11,7 @@ RUNTIME = ROOT / '.runtime'
 PIPELINE = RUNTIME / 'pipeline'
 PYTHON = ROOT / '.venv/Scripts/python.exe'
 COLMAP = RUNTIME / 'colmap/bin/colmap.exe'
+OPENMVS = RUNTIME / 'openmvs/vc17/x64/Release'
 OUTPUTS = ROOT / 'outputs'
 
 
@@ -41,14 +42,21 @@ def lichtfeld_path():
     return None
 
 
-def tool_paths(lichtfeld=None):
-    selected = Path(lichtfeld).expanduser() if lichtfeld else lichtfeld_path()
-    if not selected or not selected.is_file():
-        raise FileNotFoundError('Choose LichtFeld-Studio.exe using Browse next to LichtFeld Studio.')
-    paths = dict(python=PYTHON, colmap=COLMAP, lichtfeld=selected.resolve(),
-                 pipeline=PIPELINE / 'av1_colmap.py')
+def tool_paths(lichtfeld=None, output_type='Splat'):
+    paths = dict(python=PYTHON, colmap=COLMAP, pipeline=PIPELINE / 'av1_colmap.py')
+    if output_type in ('Splat', 'Both'):
+        selected = Path(lichtfeld).expanduser() if lichtfeld else lichtfeld_path()
+        if not selected or not selected.is_file():
+            raise FileNotFoundError('Choose LichtFeld-Studio.exe using Browse next to LichtFeld Studio.')
+        paths['lichtfeld'] = selected.resolve()
+    if output_type in ('Mesh', 'Both'):
+        paths.update(mvs_interface=OPENMVS / 'InterfaceCOLMAP.exe',
+                     mvs_reconstruct=OPENMVS / 'ReconstructMesh.exe',
+                     mvs_texture=OPENMVS / 'TextureMesh.exe')
     for name, path in paths.items():
         if not path.is_file():
+            if name.startswith('mvs_'):
+                raise FileNotFoundError('Mesh tools are missing. Run Setup.cmd once to add them, then reopen the app.')
             raise FileNotFoundError(f'{name} is missing. Run Setup.cmd, then reopen the app.')
     return {name: str(path) for name, path in paths.items()}
 

@@ -1,4 +1,4 @@
-"""Small Windows interface for converting Arcturus recordings to Gaussian PLY."""
+"""Windows interface for converting Arcturus recordings to splats and textured meshes."""
 import ctypes
 from ctypes import wintypes
 import os
@@ -10,10 +10,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from config import ROOT, STATE, OUTPUTS, preferences, save_preferences, lichtfeld_path, runtime_python
-from flow import PRESETS, NO_WINDOW, gpu_info, make_job, process_alive, read_json
+from flow import PRESETS, OUTPUT_TYPES, NO_WINDOW, gpu_info, make_job, process_alive, read_json
+from mesh import MESH_PRESETS
 
 BG, CARD, FG, MUTED, ACCENT = '#111822', '#1b2634', '#edf3fa', '#aab9cb', '#6fe3c3'
-APP_TITLE = 'Frame Splat to Resonite compatible PLY'
+APP_TITLE = 'Frame Splat & Mesh to Resonite'
 
 
 def window_work_area(window):
@@ -69,6 +70,9 @@ class App(tk.Tk):
         self.preset = tk.StringVar(value=saved.get('preset', 'Preview'))
         if self.preset.get() not in PRESETS:
             self.preset.set('Preview')
+        self.output_type = tk.StringVar(value=saved.get('output_type', 'Splat'))
+        if self.output_type.get() not in OUTPUT_TYPES:
+            self.output_type.set('Splat')
         self.prepared = tk.StringVar()
         self.gpu_label = tk.StringVar(value='Checking NVIDIA GPU…')
         self.stage = tk.StringVar(value='Choose a recording to begin')
@@ -91,16 +95,21 @@ class App(tk.Tk):
         self.bind_all('<MouseWheel>', self.scroll_page, add='+')
         main.columnconfigure(0, weight=1)
         ttk.Label(main, text=APP_TITLE, style='Title.TLabel').grid(row=0, sticky='w')
-        ttk.Label(main, text='Arcturus recording → Gaussian splat → crop → import', style='Muted.TLabel').grid(row=1, sticky='w', pady=(3, 14))
+        ttk.Label(main, text='Arcturus recording → splat or textured mesh → Resonite', style='Muted.TLabel').grid(row=1, sticky='w', pady=(3, 14))
         hardware = ttk.Frame(main)
         hardware.grid(row=2, sticky='ew', pady=(0, 10))
         ttk.Label(hardware, textvariable=self.gpu_label, style='Muted.TLabel', wraplength=650).pack(side='left')
         ttk.Button(hardware, text='Check GPU', command=self.refresh_gpu).pack(side='right')
         self.file_row(main, 3, 'Recording', self.video, self.pick_video)
         self.file_row(main, 5, 'Save results in', self.output, self.pick_output)
-        self.file_row(main, 7, 'LichtFeld Studio', self.lichtfeld, self.pick_lichtfeld)
+        self.file_row(main, 7, 'LichtFeld Studio (Splat / Both only)', self.lichtfeld, self.pick_lichtfeld)
         quality = ttk.Frame(main)
         quality.grid(row=9, sticky='ew', pady=(14, 4))
+        ttk.Label(quality, text='Output', style='Section.TLabel').pack(side='left')
+        output_combo = ttk.Combobox(quality, values=OUTPUT_TYPES, textvariable=self.output_type,
+                                    state='readonly', width=10)
+        output_combo.pack(side='left', padx=(10, 30))
+        output_combo.bind('<<ComboboxSelected>>', lambda e: self.describe())
         ttk.Label(quality, text='Quality', style='Section.TLabel').pack(side='left')
         combo = ttk.Combobox(quality, values=list(PRESETS), textvariable=self.preset, state='readonly', width=14)
         combo.pack(side='right')
@@ -129,6 +138,8 @@ class App(tk.Tk):
         ttk.Button(results, text='Open result folder', command=self.open_folder).pack(side='left')
         self.view_button = ttk.Button(results, text='Inspect / crop in LichtFeld', command=self.view, state='disabled')
         self.view_button.pack(side='left', padx=8)
+        self.mesh_button = ttk.Button(results, text='Open mesh files', command=self.open_mesh, state='disabled')
+        self.mesh_button.pack(side='left')
         self.details_button = ttk.Button(results, text='Show log', command=self.toggle_log)
         self.details_button.pack(side='right')
         self.log = tk.Text(main, height=9, bg='#0c121b', fg=MUTED, relief='flat', wrap='word',
@@ -145,6 +156,7 @@ class App(tk.Tk):
         if latest and (Path(latest) / 'settings.json').is_file():
             self.attach(Path(latest))
         self.describe()
+        self.prepared.trace_add('write', lambda *_: self.describe())
         self.fit_startup_window(main, scroll)
         self.refresh_gpu()
         self.after(500, self.poll)
@@ -210,7 +222,15 @@ class App(tk.Tk):
                 'Detailed': 'More detail for objects and short scans.',
                 'Room': 'More viewpoints for a room or connected area.'}[name]
         resolution = 'full resolution' if p['resize'] == 1 else 'half resolution'
-        self.detail.set(f'{hint}\n{p["frames"]} stereo pairs · {resolution} · {p["iterations"]:,} steps · up to {p["cap"]:,} splats')
+        capture = 'Existing images and camera positions will be reused.' if self.prepared.get() else f'{p["frames"]} stereo pairs'
+        lines = [f'{hint} {capture}']
+        if self.output_type.get() in ('Splat', 'Both'):
+            lines.append(f'Splat: {resolution} · {p["iterations"]:,} steps · up to {p["cap"]:,} splats')
+        if self.output_type.get() in ('Mesh', 'Both'):
+            m = MESH_PRESETS[name]
+            lines.append(f'Mesh: {m["max_image_size"]:,} px images · target {m["target_faces"]:,} triangles · '
+                         f'up to {m["texture_size"]:,} px per texture · OBJ + textures')
+        self.detail.set('\n'.join(lines))
 
     def refresh_gpu(self):
         threading.Thread(target=lambda: self.gpu_updates.put(gpu_info()), daemon=True).start()
@@ -241,7 +261,7 @@ class App(tk.Tk):
 
     def save_choices(self):
         save_preferences(lichtfeld=self.lichtfeld.get().strip(), output=self.output.get(),
-                         video=self.video.get(), preset=self.preset.get())
+                         video=self.video.get(), preset=self.preset.get(), output_type=self.output_type.get())
 
     def attach(self, job):
         self.job = Path(job)
@@ -253,6 +273,8 @@ class App(tk.Tk):
         self.video.set(settings.get('recording', self.video.get()))
         preset = settings.get('preset', 'Preview')
         self.preset.set(preset if preset in PRESETS else 'Preview')
+        output_type = settings.get('output_type', 'Splat')
+        self.output_type.set(output_type if output_type in OUTPUT_TYPES else 'Splat')
         self.describe()
 
     def start(self):
@@ -265,7 +287,8 @@ class App(tk.Tk):
                 raise RuntimeError('No NVIDIA CUDA GPU is available. Enable your NVIDIA GPU and check its driver, then try again.')
             self.save_choices()
             job = make_job(self.video.get(), self.output.get(), self.preset.get(),
-                           self.prepared.get() or None, lichtfeld=self.lichtfeld.get().strip())
+                           self.prepared.get() or None, lichtfeld=self.lichtfeld.get().strip(),
+                           output_type=self.output_type.get())
             subprocess.Popen([runtime_python(), '-u', str(ROOT / 'flow.py'), '--job', str(job)],
                              cwd=ROOT, creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.prepared.set('')
@@ -299,17 +322,25 @@ class App(tk.Tk):
                 running = False
                 status = dict(status, stage='Conversion interrupted', error='Files were kept. Start a new run; reuse the scan if reconstruction finished.')
             done = status.get('status') == 'complete'
-            self.stage.set('Conversion complete — inspect and crop' if done else status.get('stage', 'Loading…'))
+            self.stage.set('Conversion complete — inspect before import' if done else status.get('stage', 'Loading…'))
             self.progress['value'] = status.get('progress', 0)
             self.start_button.configure(state='disabled' if running else 'normal')
             self.stop_button.configure(state='normal' if running else 'disabled')
             final = self.job / 'scene.ply'
-            self.view_button.configure(state='normal' if done and final.is_file() else 'disabled')
+            result = status.get('result', {})
+            artifacts = result.get('artifacts', {'splat': result} if result.get('gaussians') else {})
+            self.view_button.configure(state='normal' if artifacts.get('splat') and final.is_file() else 'disabled')
+            self.mesh_button.configure(state='normal' if artifacts.get('mesh') and (self.job / 'mesh/scene.obj').is_file() else 'disabled')
             if status.get('error'):
                 self.result_text.set(status['error'])
             elif done:
-                count = status.get('result', {}).get('gaussians', 0)
-                self.result_text.set(f'{count:,} splats. Check several views, then crop unwanted background.\nTip: Crop Box → Fit to Scene (Trimmed).')
+                descriptions = []
+                if artifacts.get('splat'):
+                    descriptions.append(f'{artifacts["splat"]["gaussians"]:,} splats. Inspect / crop in LichtFeld before import.')
+                if artifacts.get('mesh'):
+                    descriptions.append(f'{artifacts["mesh"]["triangles"]:,} triangles. Import mesh/scene.obj as a 3D model; '
+                                        'keep its MTL and texture images together. Try Unlit material.')
+                self.result_text.set('\n'.join(descriptions))
             else:
                 self.result_text.set(f'Run: {self.job.name}')
             try:
@@ -351,6 +382,10 @@ class App(tk.Tk):
                 subprocess.Popen([str(executable), '--view', str(self.job / 'scene.ply'), '--no-interop'], cwd=executable.parent)
         except OSError as error:
             messagebox.showerror('Cannot open LichtFeld', str(error))
+
+    def open_mesh(self):
+        if self.job and (self.job / 'mesh/scene.obj').is_file():
+            os.startfile(str(self.job / 'mesh'))
 
     def load_previous(self):
         value = filedialog.askdirectory(title='Choose a run folder', initialdir=self.output.get())

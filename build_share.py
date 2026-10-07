@@ -7,8 +7,8 @@ ROOT = Path(__file__).resolve().parent
 PUBLIC_FILES = (
     'README.md', 'LICENSE', 'THIRD_PARTY.md', 'DEVELOPING.md', 'Guide.html',
     '.gitignore', '.gitattributes', 'requirements.txt', 'app.py', 'app.ico',
-    'config.py', 'flow.py', 'setup.py', 'build_share.py', 'Setup.cmd', 'Start.cmd',
-    'Build share zip.cmd', 'tests/test_flow.py', 'tests/test_setup.py',
+    'config.py', 'flow.py', 'mesh.py', 'setup.py', 'build_share.py', 'Setup.cmd', 'Start.cmd',
+    'Build share zip.cmd', 'tests/test_flow.py', 'tests/test_setup.py', 'tests/test_mesh.py',
     'docs/interface.jpg',
 )
 
