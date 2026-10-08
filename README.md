@@ -49,6 +49,26 @@ Mesh settings use the same stereo-pair counts, with these additional limits:
 
 Triangle counts are simplification targets, not guarantees; several texture images may be generated. Preview reduces both surface and texture detail. Mesh generation estimates dense depth on the NVIDIA GPU, then builds and textures the surface on the CPU. Progress is approximate and dense reconstruction can take a long time. A mesh is reconstructed from the source images, not converted from the trained splat.
 
+**Mesh processing** offers three choices:
+
+- **Faster (up to 800 px)** is the default. New scans calculate depth at up to 800 px. Fusion uses four CPU threads and lowers resolution further if needed to fit available memory. Recovery keeps existing depth maps. This avoids the severe repeated file loading caused by COLMAP's small disk-cache mode on large rooms.
+- **Balanced (up to 1,024 px)** calculates new depth at a middle resolution and allows more RAM than Faster for fusion, while reserving at least 2 GiB for other activity. It reduces fusion resolution further if needed to fit. It uses four threads without disk caching. This is a detail/memory choice, not a fixed 30-minute timer.
+- **Full detail** preserves the preset's surface resolution. It uses four threads when the maps fit in RAM; otherwise it uses a cache sized to currently available memory. COLMAP's cached fusion is single-threaded and large rooms can still take hours. Closing other memory-heavy applications before fusion gives it more room. No fixed completion time is guaranteed.
+
+The chosen fusion resolution, processing mode and memory estimate are recorded in `fusion-plan.json`. These choices affect new mesh depth calculations and fusion, not splat training or the photo texture limit. Faster recovery reuses previously calculated depth; its runtime is not a prediction for a fresh room scan.
+
+If a run stops or fails **after depth generation has finished**, recover it without repeating training or depth calculation:
+
+```powershell
+.venv\Scripts\python.exe flow.py --job "D:\path\to\existing-run" --resume-mesh
+```
+
+Wait for the previous worker to stop first. Recovery checks every depth/normal map and verifies the completed splat checksum, then restarts fusion, meshing and texturing in the same run folder. If the previous run reached texturing and its surface files remain, recovery retries just texturing. An explicit `--mesh-fusion` choice rebuilds from fusion instead. Partial fusion itself has no resumable checkpoint. Earlier failures still need a new run with **Reuse prepared scan**.
+
+For CLI runs or recovery, `--mesh-fusion auto` selects Faster, `--mesh-fusion balanced` selects Balanced, and `--mesh-fusion full` selects Full detail. Omitting it during recovery keeps the job's saved choice (older jobs default to Faster).
+
+If the Windows texture tool crashes with an access violation, the worker retries once with global/local seam blending disabled. Texture resolution is unchanged, but patch boundaries may be more visible. Successful fallback outputs record this limitation in `result.json` and `mesh/IMPORT.txt`.
+
 ## Remember
 
 - Walk slowly around a still subject. Capture overlapping views at different heights.

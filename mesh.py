@@ -1,10 +1,13 @@
 """Textured mesh branch: COLMAP dense stereo followed by OpenMVS surface/textures."""
 from pathlib import Path, PureWindowsPath
+import ctypes
 import hashlib
 import math
 import subprocess
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+FUSION_MODES = {'auto': 'Faster (up to 800 px)', 'balanced': 'Balanced (up to 1,024 px)',
+                'full': 'Full detail'}
 MESH_PRESETS = {
     'Preview': dict(max_image_size=768, neighbours=6, depth_iterations=3,
                     target_faces=100000, texture_size=2048),
@@ -13,6 +16,117 @@ MESH_PRESETS = {
     'Room': dict(max_image_size=1600, neighbours=12, depth_iterations=5,
                  target_faces=600000, texture_size=4096),
 }
+
+
+def depth_image_size(settings, mode=None):
+    mode = mode or settings.get('fusion_mode', 'auto')
+    if mode not in FUSION_MODES:
+        raise ValueError('Unknown mesh fusion mode.')
+    return min(settings['max_image_size'], {'auto': 800, 'balanced': 1024}.get(
+        mode, settings['max_image_size']))
+
+
+def available_memory():
+    """Read currently available physical RAM without a privileged WMI query."""
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [
+            (name, ctypes.c_ulonglong) for name in (
+                'total', 'available', 'page_total', 'page_available',
+                'virtual_total', 'virtual_available', 'extended')]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError('Could not check available RAM before mesh fusion.')
+    return status.available
+
+
+def depth_workspace_shapes(dense):
+    """Check every geometric map is complete before fusion or recovery."""
+    dense = Path(dense).resolve()
+    names = [line.strip() for line in (dense / 'stereo/fusion.cfg').read_text().splitlines()
+             if line.strip() and not line.lstrip().startswith('#')]
+    if not names or len(names) != len(set(names)):
+        raise ValueError('Depth workspace has an empty or duplicate image list.')
+    shapes = []
+    for name in names:
+        _asset(dense, dense / 'images', name)
+        shape = None
+        for folder, channels in (('depth_maps', 1), ('normal_maps', 3)):
+            path = _asset(dense, dense / 'stereo' / folder, name + '.geometric.bin')
+            with path.open('rb') as stream:
+                header = stream.read(64).split(b'&', 3)
+            try:
+                width, height, count = map(int, header[:3])
+                header_size = sum(len(part) + 1 for part in header[:3])
+                valid = (len(header) == 4 and width > 0 and height > 0 and
+                         count == channels and
+                         path.stat().st_size == header_size + width * height * count * 4)
+            except (ValueError, TypeError):
+                valid = False
+            if not valid:
+                raise ValueError(f'Incomplete or invalid depth checkpoint: {path}')
+            if shape is not None and shape != (width, height):
+                raise ValueError(f'Depth and normal map dimensions differ: {name}')
+            shape = (width, height)
+        shapes.append(shape)
+    return shapes
+
+
+def fusion_plan(dense, available_bytes=None, mode='auto'):
+    """Keep fusion in RAM: COLMAP's disk-cache mode is single-threaded.
+
+    RGB + depth + normals + visited mask use ~20 bytes/pixel. Allow 24,
+    plus 1 GiB for model/points/loading, and leave 30% of free RAM available.
+    Resizing applies only to fusion; original depth maps and textures remain.
+    """
+    if mode not in FUSION_MODES:
+        raise ValueError('Unknown mesh fusion mode.')
+    shapes = depth_workspace_shapes(dense)
+    available = available_memory() if available_bytes is None else available_bytes
+    # Balanced spends more available memory on geometry, with a 2 GiB system
+    # reserve and 1 GiB process overhead. Auto keeps a larger safety margin.
+    budget = int(min(available * .9, available - 2 * 2**30) if mode == 'balanced'
+                 else available * .7)
+    bytes_per_pixel = 20 if mode == 'balanced' else 24
+    original_size = max(max(shape) for shape in shapes)
+
+    def estimate(size):
+        pixels = sum(math.ceil(w * min(1, size / max(w, h))) *
+                     math.ceil(h * min(1, size / max(w, h))) for w, h in shapes)
+        return 2**30 + pixels * bytes_per_pixel
+
+    size = min(original_size, {'auto': 800, 'balanced': 1024}.get(mode, original_size))
+    if mode == 'full' and estimate(size) > budget:
+        # Preserve the original maps when explicitly requested. Cached fusion
+        # is slower and single-threaded, but avoids loading all maps into RAM.
+        overhead = 2 * 2**30 + sum(w * h for w, h in shapes)
+        cache_gib = math.floor((budget - overhead) / 2**30 * 4) / 4
+        if cache_gib < 1:
+            raise RuntimeError('Too little free RAM for full-detail fusion. Close other applications or choose Faster.')
+        return dict(mode=mode, images=len(shapes), original_max_image_size=size,
+                    max_image_size=size, estimated_bytes=overhead + int(cache_gib * 2**30),
+                    available_bytes=available, budget_bytes=budget, use_cache=True,
+                    cache_size_gib=cache_gib, threads=1)
+    while estimate(size) > budget and size >= 256:
+        size = ((size - 1) // 32) * 32
+    if size < 256:
+        raise RuntimeError('Too little free RAM for mesh fusion. Close other applications and resume the mesh.')
+    return dict(mode=mode, images=len(shapes), original_max_image_size=original_size,
+                max_image_size=size, estimated_bytes=estimate(size),
+                available_bytes=available, budget_bytes=budget, use_cache=False, threads=4)
+
+
+def planned_fusion_command(command, plan):
+    command = list(command)
+    for option, value in (('--StereoFusion.use_cache', int(plan['use_cache'])),
+                          ('--StereoFusion.num_threads', plan['threads']),
+                          ('--StereoFusion.cache_size', plan.get('cache_size_gib', 4)),
+                          ('--StereoFusion.max_image_size', plan['max_image_size'])):
+        if option in command:
+            command[command.index(option) + 1] = str(value)
+        else:
+            command.extend((option, str(value)))
+    return command
 
 
 def commands(dataset, job, settings, tools):
@@ -31,15 +145,16 @@ def commands(dataset, job, settings, tools):
          '--num_patch_match_src_images', m['neighbours']]),
         ('Estimating surface depth', .08, [colmap, 'patch_match_stereo',
          '--workspace_path', dense, '--workspace_format', 'COLMAP',
-         '--PatchMatchStereo.max_image_size', m['max_image_size'],
+         '--PatchMatchStereo.max_image_size', depth_image_size(m),
          '--PatchMatchStereo.num_iterations', m['depth_iterations'],
          '--PatchMatchStereo.geom_consistency', '1', '--PatchMatchStereo.cache_size', '4',
          '--PatchMatchStereo.gpu_index', '0']),
         ('Combining surface depth', .65, [colmap, 'stereo_fusion',
          '--workspace_path', dense, '--workspace_format', 'COLMAP',
          '--input_type', 'geometric', '--output_path', dense / 'fused.ply',
-         '--StereoFusion.num_threads', '4', '--StereoFusion.use_cache', '1',
-         '--StereoFusion.cache_size', '4']),
+         '--StereoFusion.num_threads', '4', '--StereoFusion.use_cache', '0',
+         '--StereoFusion.cache_size', '4',
+         '--StereoFusion.max_image_size', m['max_image_size']]),
         ('Preparing textured mesh', .74, [tools['mvs_interface'], *common,
          '--input-file', dense, '--image-folder', dense / 'images',
          '--output-file', work / 'scene.mvs']),
@@ -51,6 +166,7 @@ def commands(dataset, job, settings, tools):
          '--input-file', work / 'scene.mvs', '--mesh-file', work / 'surface.ply',
          '--output-file', export / 'scene.obj', '--export-type', 'obj',
          '--resolution-level', '0', '--max-texture-size', m['texture_size'],
+         '--global-seam-leveling', '1', '--local-seam-leveling', '1',
          '--close-holes', '0']),
     ]
     return [(stage, fraction, list(map(str, command))) for stage, fraction, command in stages]

@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from config import ROOT, STATE, OUTPUTS, preferences, save_preferences, lichtfeld_path, runtime_python
 from flow import PRESETS, OUTPUT_TYPES, NO_WINDOW, gpu_info, make_job, process_alive, read_json
-from mesh import MESH_PRESETS
+from mesh import MESH_PRESETS, FUSION_MODES, depth_image_size
 
 BG, CARD, FG, MUTED, ACCENT = '#111822', '#1b2634', '#edf3fa', '#aab9cb', '#6fe3c3'
 APP_TITLE = 'Frame Splat & Mesh to Resonite'
@@ -73,6 +73,7 @@ class App(tk.Tk):
         self.output_type = tk.StringVar(value=saved.get('output_type', 'Splat'))
         if self.output_type.get() not in OUTPUT_TYPES:
             self.output_type.set('Splat')
+        self.fusion_choice = tk.StringVar(value=FUSION_MODES.get(saved.get('fusion_mode'), FUSION_MODES['auto']))
         self.prepared = tk.StringVar()
         self.gpu_label = tk.StringVar(value='Checking NVIDIA GPU…')
         self.stage = tk.StringVar(value='Choose a recording to begin')
@@ -103,8 +104,10 @@ class App(tk.Tk):
         self.file_row(main, 3, 'Recording', self.video, self.pick_video)
         self.file_row(main, 5, 'Save results in', self.output, self.pick_output)
         self.file_row(main, 7, 'LichtFeld Studio (Splat / Both only)', self.lichtfeld, self.pick_lichtfeld)
-        quality = ttk.Frame(main)
-        quality.grid(row=9, sticky='ew', pady=(14, 4))
+        options = ttk.Frame(main)
+        options.grid(row=9, sticky='ew', pady=(14, 4))
+        quality = ttk.Frame(options)
+        quality.pack(fill='x')
         ttk.Label(quality, text='Output', style='Section.TLabel').pack(side='left')
         output_combo = ttk.Combobox(quality, values=OUTPUT_TYPES, textvariable=self.output_type,
                                     state='readonly', width=10)
@@ -114,6 +117,13 @@ class App(tk.Tk):
         combo = ttk.Combobox(quality, values=list(PRESETS), textvariable=self.preset, state='readonly', width=14)
         combo.pack(side='right')
         combo.bind('<<ComboboxSelected>>', lambda e: self.describe())
+        fusion_row = ttk.Frame(options)
+        fusion_row.pack(fill='x', pady=(8, 0))
+        ttk.Label(fusion_row, text='Mesh processing', style='Section.TLabel').pack(side='left')
+        self.fusion_combo = ttk.Combobox(fusion_row, values=list(FUSION_MODES.values()),
+                                         textvariable=self.fusion_choice, state='readonly', width=28)
+        self.fusion_combo.pack(side='left', padx=(10, 0))
+        self.fusion_combo.bind('<<ComboboxSelected>>', lambda e: self.describe())
         ttk.Label(main, textvariable=self.detail, style='Muted.TLabel', wraplength=820).grid(row=10, sticky='w', pady=(0, 12))
         actions = ttk.Frame(main)
         actions.grid(row=11, sticky='ew')
@@ -216,6 +226,7 @@ class App(tk.Tk):
         ttk.Button(frame, text='Browse…', command=callback).grid(row=0, column=1, padx=(8, 0))
 
     def describe(self):
+        self.fusion_combo.configure(state='readonly' if self.output_type.get() in ('Mesh', 'Both') else 'disabled')
         name = self.preset.get()
         p = PRESETS[name]
         hint = {'Preview': 'Start here to check a new recording.',
@@ -228,9 +239,18 @@ class App(tk.Tk):
             lines.append(f'Splat: {resolution} · {p["iterations"]:,} steps · up to {p["cap"]:,} splats')
         if self.output_type.get() in ('Mesh', 'Both'):
             m = MESH_PRESETS[name]
-            lines.append(f'Mesh: {m["max_image_size"]:,} px images · target {m["target_faces"]:,} triangles · '
+            lines.append(f'Mesh: up to {depth_image_size(m, self.fusion_mode()):,} px depth · target {m["target_faces"]:,} triangles · '
                          f'up to {m["texture_size"]:,} px per texture · OBJ + textures')
+            if self.fusion_mode() == 'auto':
+                lines.append('Fits surface fusion in RAM for speed; photo texture quality stays the same.')
+            elif self.fusion_mode() == 'balanced':
+                lines.append('Aims for 1,024 px surface fusion using more RAM; lowers it if needed. Texture quality stays the same.')
+            else:
+                lines.append('Keeps full surface detail. Large rooms can take hours if they exceed available RAM.')
         self.detail.set('\n'.join(lines))
+
+    def fusion_mode(self):
+        return next(key for key, label in FUSION_MODES.items() if label == self.fusion_choice.get())
 
     def refresh_gpu(self):
         threading.Thread(target=lambda: self.gpu_updates.put(gpu_info()), daemon=True).start()
@@ -261,7 +281,8 @@ class App(tk.Tk):
 
     def save_choices(self):
         save_preferences(lichtfeld=self.lichtfeld.get().strip(), output=self.output.get(),
-                         video=self.video.get(), preset=self.preset.get(), output_type=self.output_type.get())
+                         video=self.video.get(), preset=self.preset.get(), output_type=self.output_type.get(),
+                         fusion_mode=self.fusion_mode())
 
     def attach(self, job):
         self.job = Path(job)
@@ -275,6 +296,9 @@ class App(tk.Tk):
         self.preset.set(preset if preset in PRESETS else 'Preview')
         output_type = settings.get('output_type', 'Splat')
         self.output_type.set(output_type if output_type in OUTPUT_TYPES else 'Splat')
+        plan = read_json(self.job / 'fusion-plan.json')
+        self.fusion_choice.set(FUSION_MODES.get(plan.get('mode') or settings.get('mesh', {}).get('fusion_mode'),
+                                               FUSION_MODES['auto']))
         self.describe()
 
     def start(self):
@@ -288,7 +312,7 @@ class App(tk.Tk):
             self.save_choices()
             job = make_job(self.video.get(), self.output.get(), self.preset.get(),
                            self.prepared.get() or None, lichtfeld=self.lichtfeld.get().strip(),
-                           output_type=self.output_type.get())
+                           output_type=self.output_type.get(), fusion_mode=self.fusion_mode())
             subprocess.Popen([runtime_python(), '-u', str(ROOT / 'flow.py'), '--job', str(job)],
                              cwd=ROOT, creationflags=NO_WINDOW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.prepared.set('')

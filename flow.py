@@ -123,7 +123,8 @@ def validate_training_command(command):
     return result.stdout
 
 
-def make_job(recording, output_root, preset, prepared=None, extracted=None, lichtfeld=None, output_type='Splat'):
+def make_job(recording, output_root, preset, prepared=None, extracted=None, lichtfeld=None,
+             output_type='Splat', fusion_mode='auto'):
     recording = Path(recording).resolve()
     if not recording.is_file() or recording.suffix.lower() != '.mp4':
         raise ValueError('Choose a synced Arcturus MP4 recording.')
@@ -131,6 +132,8 @@ def make_job(recording, output_root, preset, prepared=None, extracted=None, lich
         raise ValueError('Unknown quality preset.')
     if output_type not in OUTPUT_TYPES:
         raise ValueError('Unknown output type.')
+    if fusion_mode not in mesh.FUSION_MODES:
+        raise ValueError('Unknown mesh fusion mode.')
     paths = tool_paths(lichtfeld, output_type=output_type)
     output_root = Path(output_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -177,7 +180,7 @@ def make_job(recording, output_root, preset, prepared=None, extracted=None, lich
     settings = dict(recording=str(recording), preset=preset, **PRESETS[preset],
                     prepared_dataset=str(dataset) if dataset else None,
                     extracted_run=str(extracted) if extracted else None,
-                    output_type=output_type, mesh=dict(mesh.MESH_PRESETS[preset]),
+                    output_type=output_type, mesh=dict(mesh.MESH_PRESETS[preset], fusion_mode=fusion_mode),
                     created=datetime.now().astimezone().isoformat(), adapter_version=4,
                     tools=paths)
     write_json(job / 'settings.json', settings)
@@ -190,10 +193,21 @@ class Cancelled(Exception):
     pass
 
 
+class CommandFailed(RuntimeError):
+    def __init__(self, stage, returncode):
+        self.returncode = returncode
+        super().__init__(f'{stage} failed (exit {returncode}). See conversion.log; files have been retained.')
+
+
 class Worker:
-    def __init__(self, job):
+    def __init__(self, job, resume_mesh=False, fusion_mode=None):
         self.job = Path(job).resolve()
+        self.resume_mesh = resume_mesh
+        self.fusion_override = fusion_mode is not None
+        self.texture_without_seams = False
+        self.mesh_resume_index = 2
         self.settings = read_json(self.job / 'settings.json')
+        self.fusion_mode = fusion_mode or self.settings.get('mesh', {}).get('fusion_mode', 'auto')
         self.output_type = self.settings.get('output_type', 'Splat')
         self.tools = self.settings.get('tools') or tool_paths(output_type=self.output_type)
         self.training_range = (42, 68 if self.output_type == 'Both' else 96)
@@ -275,7 +289,7 @@ class Worker:
                     self.update(stage='Training Gaussian splats', progress=start + (end - start) * int(training[1]) / self.settings['iterations'])
             code = proc.wait()
             if code:
-                raise RuntimeError(f'{stage} failed (exit {code}). See conversion.log; files have been retained.')
+                raise CommandFailed(stage, code)
         except BaseException:
             if proc.poll() is None:
                 subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
@@ -293,23 +307,51 @@ class Worker:
         write_json(self.job / 'result.json', result)
         self.update(result=result)
 
-    def build_mesh(self, stages):
+    def build_mesh(self, stages, start_index=0):
         work, export = self.job / 'mesh-work', self.job / 'mesh'
-        work.mkdir(exist_ok=False)
-        export.mkdir(exist_ok=False)
+        work.mkdir(exist_ok=start_index > 0)
+        export.mkdir(exist_ok=start_index > 0)
         start = 69 if self.output_type == 'Both' else 42
         for index, (stage, fraction, command) in enumerate(stages):
+            if index < start_index:
+                continue
             self.check_cancel()
             self.update(stage=stage, progress=start + (96 - start) * fraction)
+            if stage == 'Combining surface depth':
+                plan = mesh.fusion_plan(work / 'dense', mode=self.fusion_mode)
+                write_json(self.job / 'fusion-plan.json', plan)
+                self.emit(f'Fusion memory plan: {plan["images"]} images, '
+                          f'{plan["max_image_size"]} px (original {plan["original_max_image_size"]}), '
+                          f'{plan["estimated_bytes"] / 2**30:.1f} GiB estimated, {plan["threads"]} threads, '
+                          f'disk cache {plan.get("cache_size_gib", 0):g} GiB. '
+                          'Original depth maps and texture images are retained.')
+                if plan['use_cache']:
+                    self.emit('Full detail exceeds the RAM budget. Cached fusion preserves resolution '
+                              'but can take hours on large rooms. Faster or Balanced avoids this.')
+                command = mesh.planned_fusion_command(command, plan)
             previous_logs = set(work.glob('*.log'))
+            if stage == 'Applying photo textures' and self.texture_without_seams:
+                command = self.texture_recovery_command(command)
             try:
                 next_fraction = stages[index + 1][1] if index + 1 < len(stages) else 1
-                self.run_command(command, stage, cwd=work, progress_range=(
-                    start + (96 - start) * fraction, start + (96 - start) * next_fraction))
+                try:
+                    self.run_command(command, stage, cwd=work, progress_range=(
+                        start + (96 - start) * fraction, start + (96 - start) * next_fraction))
+                except CommandFailed as error:
+                    if (stage != 'Applying photo textures' or self.texture_without_seams or
+                            error.returncode & 0xffffffff != 0xc0000005):
+                        raise
+                    self.texture_without_seams = True
+                    self.emit('Texture tool access violation; retrying once without seam blending. '
+                              'Photo resolution is unchanged, but patch boundaries may be more visible.')
+                    self.run_command(self.texture_recovery_command(command), stage, cwd=work)
             finally:
                 # The Windows OpenMVS binaries write diagnostics to files, not stdout.
                 for log in sorted(set(work.glob('*.log')) - previous_logs):
                     self.emit(log.read_text(encoding='utf-8', errors='replace'))
+            if stage == 'Estimating surface depth':
+                write_json(self.job / 'mesh-depth-complete.json', dict(
+                    completed=datetime.now().astimezone().isoformat()))
             if stage == 'Combining surface depth':
                 fused = work / 'dense/fused.ply'
                 if not fused.is_file() or not fused.with_suffix('.ply.vis').is_file():
@@ -317,19 +359,98 @@ class Worker:
         self.check_cancel()
         self.update(stage='Verifying textured mesh', progress=97)
         artifact = mesh.validate_obj(export / 'scene.obj')
+        if self.texture_without_seams:
+            artifact['warnings'] = ['Texture seam blending was disabled after a tool crash; photo patch boundaries may be visible.']
         (export / 'IMPORT.txt').write_text(
             'Import scene.obj into Resonite as a regular 3D model.\n'
             'Keep the OBJ, MTL and texture images together in this folder.\n'
             'Try Unlit / PBR Emissive material for the captured photo lighting.\n'
             'Inspect scale, orientation, missing surfaces and performance.\n'
             'This is a visual mesh, not an automatically validated collision mesh.\n', encoding='utf-8')
+        if self.texture_without_seams:
+            with (export / 'IMPORT.txt').open('a', encoding='utf-8') as stream:
+                stream.write(artifact['warnings'][0] + '\n')
         self.save_artifact('mesh', artifact)
         self.emit(f'TEXTURED MESH EXPORTED: {artifact["path"]} ({artifact["triangles"]:,} triangles)')
+
+    def texture_recovery_command(self, command):
+        command = list(command)
+        for option in ('--global-seam-leveling', '--local-seam-leveling'):
+            if option in command:
+                command[command.index(option) + 1] = '0'
+            else:
+                command.extend((option, '0'))
+        write_json(self.job / 'texture-recovery.json', dict(
+            reason='Texture tool access violation', global_seam_leveling=False,
+            local_seam_leveling=False, texture_resolution_unchanged=True))
+        return command
+
+    def validate_mesh_resume(self):
+        previous = read_json(self.job / 'status.json')
+        if previous.get('status') not in ('cancelled', 'failed'):
+            raise ValueError('Stop the existing run before resuming its mesh.')
+        if any(process_alive(previous.get(key)) for key in ('pid', 'child_pid')):
+            raise ValueError('The previous worker is still stopping. Try again after it exits.')
+        if self.output_type not in ('Mesh', 'Both'):
+            raise ValueError('This run did not request a mesh.')
+        history = read_json(self.job / 'commands.json').get('commands', [])
+        # Older jobs predate the completion marker. Reaching fusion proves that
+        # the worker observed successful completion of geometric depth generation.
+        attempted_fusion = any(len(command) > 1 and command[1] == 'stereo_fusion'
+                               for command in history)
+        if not (self.job / 'mesh-depth-complete.json').is_file() and not attempted_fusion:
+            raise ValueError('No completed depth checkpoint. Reuse the prepared scan in a new run.')
+        shapes = mesh.depth_workspace_shapes(self.job / 'mesh-work/dense')
+        expected = read_json(self.job / 'reconstruction.json').get('registered_images')
+        if expected and len(shapes) != expected:
+            raise ValueError('Depth checkpoint is missing registered camera views.')
+        result = read_json(self.job / 'result.json')
+        artifacts = result.get('artifacts', {})
+        if self.output_type == 'Both':
+            splat = artifacts.get('splat', {})
+            path = self.job / 'scene.ply'
+            if (not splat.get('validated') or not path.is_file() or
+                    Path(splat.get('path', '')).resolve() != path or
+                    splat.get('sha256') != sha256(path)):
+                raise ValueError('The completed splat could not be verified; it will not be overwritten.')
+        self.artifacts = artifacts
+        attempted_textures = any(command and Path(command[0]).stem.lower() == 'texturemesh'
+                                 for command in history)
+        if attempted_textures and not self.fusion_override:
+            work = self.job / 'mesh-work'
+            if not all(path.is_file() and path.stat().st_size > 0
+                       for path in (work / 'scene.mvs', work / 'surface.ply')):
+                raise ValueError('Completed surface checkpoint is missing; use --mesh-fusion to rebuild it.')
+            self.mesh_resume_index = 5
+            # Retry the known Windows native crash directly, without first
+            # repeating the same five-minute failing texturing attempt.
+            self.texture_without_seams = ('3221225477' in previous.get('error', '') or
+                                          '-1073741819' in previous.get('error', '') or
+                                          (self.job / 'texture-recovery.json').is_file())
+        return previous, result
+
+    def recover_mesh(self, previous, result):
+        dataset = Path(self.settings['prepared_dataset']) if self.settings['prepared_dataset'] else self.job / 'dataset'
+        stages = mesh.commands(dataset, self.job, self.settings, self.tools)
+        if self.texture_without_seams:
+            stage, fraction, command = stages[-1]
+            stages[-1] = (stage, fraction, self.texture_recovery_command(command))
+        mesh.preflight(stages[self.mesh_resume_index:], self.job / 'mesh-resume-preflight')
+        self.check_cancel()
+        history = read_json(self.job / 'mesh-resumes.json').get('attempts', [])
+        history.append(dict(previous_status=previous, resumed=self.state['started']))
+        write_json(self.job / 'mesh-resumes.json', dict(attempts=history))
+        self.update(started=previous.get('started', self.state['started']), result=result,
+                    reconstruction=read_json(self.job / 'reconstruction.json'))
+        self.emit('Resuming ' + ('photo texturing from the completed surface' if self.mesh_resume_index == 5
+                                 else 'mesh from completed geometric depth maps') + '; keeping existing splat.')
+        self.build_mesh(stages, start_index=self.mesh_resume_index)
 
     def execute(self):
         STATE.mkdir(parents=True, exist_ok=True)
         lock = STATE / 'running.lock'
         acquired = False
+        started = False
         # Keep only the system awake during work; the display may still turn off.
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
         try:
@@ -341,7 +462,20 @@ class Worker:
             with lock.open('x', encoding='utf-8') as stream:
                 json.dump(dict(pid=os.getpid(), path=str(self.job)), stream)
             acquired = True
+            resume_data = self.validate_mesh_resume() if self.resume_mesh else None
+            if resume_data:
+                # Remove only the previous run's stop request, before publishing
+                # running status. A new Stop during preflight must be honoured.
+                (self.job / 'STOP').unlink(missing_ok=True)
             self.update()
+            started = True
+            if resume_data:
+                self.update(result=resume_data[1])
+                self.recover_mesh(*resume_data)
+                self.check_cancel()
+                self.update(status='complete', stage='Conversion complete — inspect before import', progress=100,
+                            finished=datetime.now().astimezone().isoformat())
+                return 0
             self.check_cancel()
             gpu = gpu_info()
             self.emit('GPU: ' + json.dumps(gpu))
@@ -408,7 +542,8 @@ class Worker:
         except BaseException as error:
             import traceback
             self.emit(traceback.format_exc())
-            self.update(status='failed', stage='Needs attention', error=str(error))
+            if started:
+                self.update(status='failed', stage='Needs attention', error=str(error))
             return 1
         finally:
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
@@ -455,6 +590,10 @@ def main():
     parser.add_argument('--output-type', choices=OUTPUT_TYPES, default='Splat')
     parser.add_argument('--prepared', type=Path)
     parser.add_argument('--reuse-extraction', type=Path)
+    parser.add_argument('--resume-mesh', action='store_true',
+                        help='Resume a stopped/failed --job from completed geometric depth maps')
+    parser.add_argument('--mesh-fusion', choices=mesh.FUSION_MODES,
+                        help='auto prioritizes speed; balanced aims for 1024 px; full preserves surface resolution')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--lichtfeld', type=Path, help='Path to LichtFeld-Studio.exe')
     args = parser.parse_args()
@@ -463,10 +602,13 @@ def main():
         return 0
     if not args.job and not args.video:
         parser.error('Choose --video or an existing queued --job.')
-    job = args.job or make_job(args.video, args.output_root, args.preset, args.prepared, args.reuse_extraction, args.lichtfeld, args.output_type)
-    if args.job and read_json(job / 'status.json').get('status') != 'queued':
+    if args.resume_mesh and not args.job:
+        parser.error('--resume-mesh requires --job.')
+    job = args.job or make_job(args.video, args.output_root, args.preset, args.prepared, args.reuse_extraction,
+                               args.lichtfeld, args.output_type, args.mesh_fusion or 'auto')
+    if args.job and not args.resume_mesh and read_json(job / 'status.json').get('status') != 'queued':
         raise RuntimeError('Existing jobs cannot be restarted. Create a new run; reuse a completed dataset if desired.')
-    return Worker(job).execute()
+    return Worker(job, resume_mesh=args.resume_mesh, fusion_mode=args.mesh_fusion).execute()
 
 
 if __name__ == '__main__':
